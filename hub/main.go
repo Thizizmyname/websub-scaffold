@@ -5,16 +5,80 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io/ioutil"
 	"log"
 	"net/http"
+	"sync"
 	"time"
 )
 
-// Map with a topic as key, and each topic having a subsequent map of subscribers and their secret.
-var subscriberMap map[string]map[string]string
+/******************************************************************
+ * subMapStruct
+ * Map with a topic as key, and each topic having a subsequent map of subscribers and their secret.
+ * Methods prevents data races, through mutex and shallow-copy for enumeration.
+ ******************************************************************/
+type (
+	subCallerMap = map[string]string
+	subTopicMap  = map[string]subCallerMap
+)
 
+var subMap subMapStruct
+
+type subMapStruct struct {
+	topicMap subTopicMap
+	rwm      sync.RWMutex
+}
+
+func (m *subMapStruct) init() {
+	m.topicMap = make(subTopicMap)
+}
+
+func (m *subMapStruct) add(topic, callback, secret string) {
+	m.rwm.RLock()
+	defer m.rwm.RUnlock()
+
+	// Create topic map if topic is not known.
+	// Probably the publisher should have the authority to create and remove topics
+	// and not a subscriber, but it is this way for the example to work.
+	if _, ok := m.topicMap[topic]; !ok {
+		m.topicMap[topic] = make(subCallerMap)
+	}
+
+	// Add client or update secret
+	m.topicMap[topic][callback] = secret
+
+}
+
+func (m *subMapStruct) remove(topic, callback string) {
+	m.rwm.RLock()
+	defer m.rwm.RUnlock()
+
+	if _, ok := m.topicMap[topic]; ok {
+		delete(m.topicMap[topic], callback)
+	}
+}
+
+/* safeCopy
+ * Returns a copy of a topics subscriber-list.
+ * This is to ensure race free enumeration on a given topic.
+ */
+func (m *subMapStruct) safeCopy(topic string) subCallerMap {
+	m.rwm.RLock()
+	defer m.rwm.RUnlock()
+
+	res := make(subCallerMap)
+	for key, value := range m.topicMap[topic] {
+		res[key] = value
+	}
+	return res
+}
+
+/******************************************************************
+ * Logging
+ * Helper function and enum to abstract and unify the log structure.
+ ******************************************************************/
 // Helper structure to assist in logging
 type logType string
 
@@ -30,45 +94,37 @@ func hubLog(ty logType, message string) {
 	fmt.Printf("time=\"%v\"  level=%v msg=%v\n", t, ty, message)
 }
 
+/******************************************************************
+ * Websub hub
+ * All functions to handle and respond to websub requests
+ ******************************************************************/
+
 /* handleRequest
  * takes a request and determines what type of request it is.
  * if a subscribe-event, a confirmation is required before adding the requester as subscriber.
  */
-func handleRequest(mode, topic, callback, secret string) (bool, error) {
-	valid := false
+func handleRequest(mode, topic, callback, secret string) error {
 	var err error
 
 	switch mode {
 	case "unsubscribe":
 
-		if _, ok := subscriberMap[topic]; ok {
-			delete(subscriberMap[topic], callback)
-		}
-		// In this example no logic to remove a topic is implemented
-		valid = true
+		subMap.remove(topic, callback)
 
 	case "subscribe":
 
 		// Confirm request before adding subscriber
-		valid = confirmRequest(callback, topic)
-
-		if valid {
-			// Create topic map if topic is not known.
-			// Probably the publisher should have the authority to create and remove topics
-			// and not a subscriber, but it is this way for the example to work.
-			if _, ok := subscriberMap[topic]; !ok {
-				subscriberMap[topic] = make(map[string]string)
-			}
-
-			// Add client or update secret
-			subscriberMap[topic][callback] = secret
+		if confirmRequest(callback, topic) {
+			subMap.add(topic, callback, secret)
+		} else {
+			err = errors.New("[Request Validation] could not process request, regarded as failed")
 		}
 
 	default:
 		err = fmt.Errorf("[Request Validation] mode \"%v\" not supported", mode)
 	}
 
-	return valid, err
+	return err
 }
 
 /* denyRequest
@@ -87,10 +143,8 @@ func denyRequest(callback, topic, reason string) {
 	req.URL.RawQuery = q.Encode()
 
 	resp, err := client.Do(req)
-
 	if err != nil {
-		hubLog(Error, "Error when sending request to the server")
-		return
+		hubLog(Error, fmt.Sprintf("[Deny Request Error] %v", err.Error()))
 	}
 	defer resp.Body.Close()
 
@@ -117,17 +171,16 @@ func confirmRequest(callback, topic string) bool {
 	req.URL.RawQuery = q.Encode()
 
 	resp, err := client.Do(req)
-
+	defer resp.Body.Close()
 	if err != nil {
-		hubLog(Error, "Error when sending request to the server")
+		hubLog(Error, fmt.Sprintf("[Confirm Request Error] %v", err.Error()))
 		return false
 	}
-	defer resp.Body.Close()
 
 	// Read Response Body
 	respBody, err := ioutil.ReadAll(resp.Body)
 	if err != nil {
-		hubLog(Error, fmt.Sprintf("[HEALTH CHECK] Could not read response body : %v", err))
+		hubLog(Error, fmt.Sprintf("[HEALTH CHECK] Could not read response body : %v", err.Error()))
 		return false
 	}
 	// If client does not return correct result,
@@ -152,7 +205,7 @@ func hubRequest(w http.ResponseWriter, r *http.Request) {
 	if r.Method == "POST" {
 
 		if err := r.ParseForm(); err != nil {
-			fmt.Println("ParseForm() err:", err)
+			hubLog(Error, fmt.Sprintf("[Parse Error] %v", err.Error()))
 			return
 		}
 		// Required fields
@@ -167,10 +220,10 @@ func hubRequest(w http.ResponseWriter, r *http.Request) {
 
 		hubLog(Info, fmt.Sprintf("%v request from %v", mode, callback))
 
-		accepted, err := handleRequest(mode, topic, callback, secret)
+		err := handleRequest(mode, topic, callback, secret)
 
 		// If request is denied for any reason, send a denial
-		if accepted == false {
+		if err != nil {
 			hubLog(Info, err.Error())
 
 			denyRequest(callback, topic, err.Error())
@@ -192,8 +245,12 @@ func publish(w http.ResponseWriter, r *http.Request) {
 	hubLog(Info, "Broadcasting example message on topic: \"/a/topic\"")
 
 	// Iterate through every subscriber
-	for subscriber, secret := range subscriberMap[topic] {
+	for subscriber, secret := range subMap.safeCopy(topic) {
 		req, err := http.NewRequest("POST", subscriber, bytes.NewBuffer(jsonStr))
+		if err != nil {
+			hubLog(Error, fmt.Sprintf("[Publish Error] %v", err.Error()))
+			return
+		}
 
 		// Generate HMAC
 		mac := hmac.New(sha256.New, []byte(secret))
@@ -204,10 +261,11 @@ func publish(w http.ResponseWriter, r *http.Request) {
 		req.Header.Set("X-Hub-Signature", "sha256="+hmac)
 
 		resp, err := client.Do(req)
-		if err != nil {
-			panic(err)
-		}
 		defer resp.Body.Close()
+		if err != nil {
+			hubLog(Error, fmt.Sprintf("[Publish Error] %v", err.Error()))
+			return
+		}
 
 		if resp.Status != "200 OK" {
 			hubLog(Error, fmt.Sprintf("[Publish Error] Response status : [%v] at %v", resp.Status, subscriber))
@@ -216,7 +274,7 @@ func publish(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
-	subscriberMap = make(map[string]map[string]string)
+	subMap.init()
 
 	http.HandleFunc("/", hubRequest)
 	http.HandleFunc("/publish", publish)
