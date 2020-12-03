@@ -36,8 +36,8 @@ func (m *subMapStruct) init() {
 }
 
 func (m *subMapStruct) add(topic, callback, secret string) {
-	m.rwm.RLock()
-	defer m.rwm.RUnlock()
+	m.rwm.Lock()
+	defer m.rwm.Unlock()
 
 	// Create topic map if topic is not known.
 	// Probably the publisher should have the authority to create and remove topics
@@ -52,8 +52,8 @@ func (m *subMapStruct) add(topic, callback, secret string) {
 }
 
 func (m *subMapStruct) remove(topic, callback string) {
-	m.rwm.RLock()
-	defer m.rwm.RUnlock()
+	m.rwm.Lock()
+	defer m.rwm.Unlock()
 
 	if _, ok := m.topicMap[topic]; ok {
 		delete(m.topicMap[topic], callback)
